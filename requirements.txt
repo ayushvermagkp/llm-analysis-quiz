@@ -1,7 +1,6 @@
+playwright==1.45.0
 fastapi
 uvicorn
 httpx
-playwright
 beautifulsoup4
-pandas
-pypdf
+pydantic
