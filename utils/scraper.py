@@ -5,6 +5,6 @@ async def fetch_quiz_page(url):
         browser = await p.chromium.launch()
         page = await browser.new_page()
         await page.goto(url, wait_until="networkidle")
-        html = await page.content()
+        html = await page.content()  # rendered HTML after JS executes
         await browser.close()
         return html

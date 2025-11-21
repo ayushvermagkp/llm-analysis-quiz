@@ -1,44 +1,59 @@
 from bs4 import BeautifulSoup
 import re
+import base64
 
 async def process_quiz_page(html):
     """
-    Parse quiz page HTML and extract:
-    - The answer (if identifiable)
-    - The submit URL
+    Parses the rendered quiz page and extracts:
+    - Quiz instructions
+    - Submit URL
+    - Answer (if detectable)
     """
-
     soup = BeautifulSoup(html, "html.parser")
-
-    # Clean readable text from page
     text = soup.get_text(" ", strip=True)
 
-    # Always extract submit URL (required for quiz)
+    # Decode Base64 quiz content inside <script>
+    decoded = extract_and_decode_base64(html)
+    if decoded:
+        text += " " + decoded
+
     submit_url = extract_submit_url(text)
     if not submit_url:
         return None, None
 
-    lower_text = text.lower()
+    lower = text.lower()
 
-    # ---------------------------
-    # EXAMPLE: Identify a sum question
-    # ---------------------------
-    if "sum of" in lower_text and "value" in lower_text:
-        # TODO: Replace this with real data extraction logic
-        answer = 123  
+    # Example quiz type handling
+    if "sum of" in lower and "value" in lower:
+        # TODO: implement real logic
+        answer = 123
         return answer, submit_url
 
-    # If unable to detect quiz type yet, still return submit_url
     return None, submit_url
+
+
+def extract_and_decode_base64(html):
+    """
+    Searches for atob(`...`) containing base64-encoded content.
+    """
+    pattern = r"atob\(`([^`]+)`\)"
+    match = re.search(pattern, html)
+    if not match:
+        return None
+
+    b64_text = match.group(1).strip()
+
+    try:
+        decoded = base64.b64decode(b64_text).decode("utf-8", errors="ignore")
+        return decoded
+    except:
+        return None
 
 
 def extract_submit_url(text):
     """
-    Extract submit URL from the quiz page text.
-    The page usually contains something like:
-    'Post your answer to https://example.com/submit with this JSON payload'
+    Find the submit URL in the decoded quiz text.
     """
-
     pattern = r"https?://[^\s'\"]*submit[^\s'\"]*"
     match = re.search(pattern, text)
     return match.group(0) if match else None

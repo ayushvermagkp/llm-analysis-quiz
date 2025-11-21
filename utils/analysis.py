@@ -1,13 +1,17 @@
 import httpx
 
-async def submit_answer(email, secret, url, submit_url, answer):
+async def submit_answer(email, secret, quiz_url, submit_url, answer):
     payload = {
         "email": email,
         "secret": secret,
-        "url": url,
+        "url": quiz_url,
         "answer": answer
     }
 
-    async with httpx.AsyncClient() as client:
-        r = await client.post(submit_url, json=payload)
-        return r.json()
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(submit_url, json=payload)
+
+    try:
+        return response.json()
+    except:
+        return {"correct": False, "error": "Invalid JSON from submit server"}
