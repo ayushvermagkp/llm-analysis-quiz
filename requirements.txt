@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+playwright
+beautifulsoup4
+pandas
+pypdf
