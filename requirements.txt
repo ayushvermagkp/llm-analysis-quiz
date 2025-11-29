@@ -3,5 +3,4 @@ uvicorn
 httpx
 beautifulsoup4
 playwright==1.45.0
-email-validator
-pydantic[email] 
+pydantic[email]

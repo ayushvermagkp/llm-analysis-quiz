@@ -1,121 +1,151 @@
-from bs4 import BeautifulSoup
+# utils/parser.py
 from dataclasses import dataclass
-import base64
-import json
-import re
 from typing import Any, Optional
-
+from bs4 import BeautifulSoup
+import base64
+import re
+from urllib.parse import urljoin
 
 @dataclass
 class QuizInterpretation:
-    """Represents what we understood from a single quiz page."""
     submit_url: Optional[str]
     answer: Any
     summary: str
 
 
-async def interpret_quiz_page(html: str, quiz_url: str) -> QuizInterpretation:
+async def interpret_quiz_page(html: str, base_url: str) -> QuizInterpretation:
     """
-    Takes the rendered HTML (after JS execution) and tries to:
-    - Decode any base64-encoded quiz instructions.
-    - Extract the submit URL.
-    - Infer the answer if the question is simple enough.
+    Robust interpretation:
+      - parse rendered HTML
+      - decode atob(`...`) Base64 blocks (many quizzes hide content this way)
+      - attempt to extract JSON block answer or simple heuristics
+      - robustly extract submit URL (handles spaces/newlines/broken formatting)
     """
-
+    # 1) plain visible text
     soup = BeautifulSoup(html, "html.parser")
     visible_text = soup.get_text(" ", strip=True)
 
-    # Try to decode any atob(`...`) blocks we see in the raw HTML.
+    # 2) decode any atob(`...`) blocks and join
     decoded_blocks = _decode_atob_blocks(html)
+    decoded_text = " ".join(decoded_blocks) if decoded_blocks else ""
 
-    combined_text = visible_text + " " + " ".join(decoded_blocks)
-    combined_lower = combined_text.lower()
+    # 3) combined text for searching
+    combined = " ".join([visible_text, decoded_text]).strip()
+    combined_clean = _normalize_whitespace(combined)
 
-    submit_url = _find_submit_url(combined_text)
-    summary = combined_text[:800]  # keep a short snippet for debugging
+    # 4) find submit url (robust)
+    submit_url = _extract_submit_url(combined_clean)
 
-    # Default: we don't know the answer yet.
-    answer: Any = None
+    # if submit_url is a relative path (starts with '/'), make absolute
+    if submit_url and submit_url.startswith("/"):
+        submit_url = urljoin(base_url, submit_url)
 
-    # ---------------------------------------------------------
-    # Simple heuristic: look for an "answer" field in a JSON
-    # snippet inside the decoded block, or patterns like:
-    # "answer": 12345
-    # ---------------------------------------------------------
-    json_answer = _extract_answer_from_json_block(decoded_blocks)
-    if json_answer is not None:
-        answer = json_answer
-        return QuizInterpretation(submit_url=submit_url, answer=answer, summary=summary)
+    # 5) try to extract an "answer" from any JSON block in decoded content
+    answer = _extract_answer_from_decoded(decoded_blocks)
 
-    # Example heuristic for questions like:
-    # "What is the sum of the 'value' column in ..."
-    if "sum of" in combined_lower and "value" in combined_lower:
-        # At this point, a full implementation would:
-        # - Download the linked file (e.g., PDF/CSV)
-        # - Extract the relevant data
-        # - Compute the aggregation
-        #
-        # For now, we leave answer=None so that the quiz server
-        # can tell us if the missing answer is wrong.
-        answer = None
-        return QuizInterpretation(submit_url=submit_url, answer=answer, summary=summary)
+    # 6) fallback heuristics: detect simple "sum of ... value" questions (demo)
+    lower = combined_clean.lower()
+    if answer is None:
+        if "sum of" in lower and "value" in lower:
+            # We don't implement full PDF/table extraction in this function.
+            # Returning None allows the remote server to judge; you can implement
+            # file download+parsing in a later step if required by the quiz.
+            answer = None
 
-    # Fallback: we don't know the answer yet, but we at least return submit URL
+    # 7) Return a short summary for debugging as well
+    summary = combined_clean[:1600]
     return QuizInterpretation(submit_url=submit_url, answer=answer, summary=summary)
 
 
-# --------------------------------------------------------------------
-# Helper functions
-# --------------------------------------------------------------------
+# -------------------------
+# Helpers
+# -------------------------
+def _normalize_whitespace(s: str) -> str:
+    # Remove zero-width and control characters, collapse whitespace
+    s = re.sub(r"[\u200B\u200C\u200D\uFEFF]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
-def _decode_atob_blocks(html: str) -> list[str]:
+
+def _decode_atob_blocks(html: str):
     """
-    Finds JavaScript atob(`...`) blocks in the HTML and decodes each one.
-    Returns a list of decoded text blocks.
+    Find atob(`...`) occurrences and decode base64 inside.
+    Accept multiple patterns and ignore decode failures.
     """
-    pattern = r"atob\(`([^`]+)`\)"
-    blocks = re.findall(pattern, html)
-    decoded: list[str] = []
-
-    for b64_chunk in blocks:
-        try:
-            decoded_text = base64.b64decode(b64_chunk).decode("utf-8", errors="ignore")
-            decoded.append(decoded_text)
-        except Exception:
-            # Ignore chunks that fail to decode
-            continue
-
+    # pattern captures content inside atob(`...`) or atob("...") forms
+    patterns = [
+        r"atob\(\s*`([^`]+)`\s*\)",
+        r"atob\(\s*\"([^\"]+)\"\s*\)",
+        r"atob\(\s*'([^']+)'\s*\)",
+    ]
+    decoded = []
+    for pat in patterns:
+        for m in re.findall(pat, html, flags=re.DOTALL):
+            b64 = m.strip()
+            # Remove spaces/newlines inside base64 block that may have been wrapped
+            b64 = re.sub(r"\s+", "", b64)
+            try:
+                txt = base64.b64decode(b64).decode("utf-8", errors="ignore")
+                decoded.append(txt)
+            except Exception:
+                # ignore decode failures
+                continue
     return decoded
 
 
-def _find_submit_url(text: str) -> Optional[str]:
+def _extract_submit_url(text: str) -> Optional[str]:
     """
-    Extracts the submit URL from text of the form:
-    'Post your answer to https://example.com/submit ...'
+    Robustly extract '.../submit' URLs even when broken by spaces or newlines.
+    Steps:
+      - normalize newlines
+      - fix 'http : //', 'https : //' broken protocol spaces
+      - remove spaces around slashes and dots in domain when likely broken
+      - then run a simple regex that searches for 'submit' in URL
     """
-    pattern = r"https?://[^\s'\"<>]+submit[^\s'\"<>]*"
-    match = re.search(pattern, text)
-    return match.group(0) if match else None
+    if not text:
+        return None
+
+    t = text.replace("\r", " ").replace("\n", " ")
+    # fix protocol breaks: "https : //"
+    t = re.sub(r"https?\s*:\s*//", lambda m: m.group(0).replace(" ", ""), t, flags=re.IGNORECASE)
+
+    # fix common broken patterns: "domain . com" => "domain.com", " /submit" => "/submit"
+    # be conservative: only remove spaces around dots/slashes when adjacent to alnum
+    t = re.sub(r"(?<=\w)\s+/\s*(?=submit)", "/", t, flags=re.IGNORECASE)
+    t = re.sub(r"(?<=\w)\s+\.\s+(?=\w)", ".", t)
+
+    # collapse multiple spaces
+    t = " ".join(t.split())
+
+    # final regex to match URL that contains 'submit' word
+    pattern = r"https?://[^\s'\"<>]*submit[^\s'\"<>]*"
+    m = re.search(pattern, t, flags=re.IGNORECASE)
+    if m:
+        return m.group(0)
+
+    # If not absolute URL, try to find relative "/submit" pattern and return that
+    rel = re.search(r"(/[\w\-/]*submit[^\s'\"<>]*)", t, flags=re.IGNORECASE)
+    if rel:
+        return rel.group(1)
+
+    return None
 
 
-def _extract_answer_from_json_block(decoded_blocks: list[str]) -> Optional[Any]:
+def _extract_answer_from_decoded(blocks):
     """
-    If any decoded block contains a JSON blob with an "answer" field,
-    pull it out. This works nicely with the sample structure in the spec.
+    Look for JSON-like blocks that include an "answer" field.
+    If found and parseable, return that answer.
     """
-    for block in decoded_blocks:
-        # Try to find a JSON object in <pre>...</pre> or similar
-        # For example:
-        # {
-        #   "email": "...",
-        #   "secret": "...",
-        #   "url": "...",
-        #   "answer": 12345
-        # }
-        json_like = _extract_braced_json(block)
-        for candidate in json_like:
+    if not blocks:
+        return None
+
+    for block in blocks:
+        # naive brace-based extraction of JSON substrings
+        candidates = _extract_braced_json(block)
+        for cand in candidates:
             try:
-                data = json.loads(candidate)
+                import json
+                data = json.loads(cand)
                 if "answer" in data:
                     return data["answer"]
             except Exception:
@@ -123,25 +153,19 @@ def _extract_answer_from_json_block(decoded_blocks: list[str]) -> Optional[Any]:
     return None
 
 
-def _extract_braced_json(text: str) -> list[str]:
-    """
-    Very lightweight brace-matching to pull out JSON-like substrings.
-    Not perfect, but good enough for the demo/test.
-    """
-    results: list[str] = []
+def _extract_braced_json(text: str):
+    results = []
     stack = []
-    start_idx = None
-
+    start = None
     for i, ch in enumerate(text):
         if ch == "{":
             if not stack:
-                start_idx = i
-            stack.append(ch)
+                start = i
+            stack.append("{")
         elif ch == "}":
             if stack:
                 stack.pop()
-                if not stack and start_idx is not None:
-                    results.append(text[start_idx: i + 1])
-                    start_idx = None
-
+                if not stack and start is not None:
+                    results.append(text[start: i+1])
+                    start = None
     return results
