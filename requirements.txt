@@ -4,3 +4,4 @@ httpx
 beautifulsoup4
 playwright==1.45.0
 pydantic[email]
+email-validator
