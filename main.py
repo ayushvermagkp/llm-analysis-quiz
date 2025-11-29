@@ -1,75 +1,143 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel, EmailStr, HttpUrl, ValidationError
+from typing import Any, Optional
 import time
+import os
 
 from utils.scraper import fetch_quiz_page
-from utils.parser import process_quiz_page
-from utils.analysis import submit_answer
+from utils.parser import interpret_quiz_page
+from utils.analysis import post_answer
 
-app = FastAPI()
 
-SECRET = "ayush$23f1001266@123"  # your secret
+# ----------------------------
+# Configuration
+# ----------------------------
+
+# Read secret from env if present, otherwise fall back to a default.
+# Make sure the value here matches what you filled in the Google Form.
+SECRET = os.getenv("QUIZ_SECRET", "ayush$23f1001266@123")
+
+# 3-minute limit from the time their POST hits our endpoint
+QUIZ_TIME_LIMIT_SECONDS = 3 * 60
+
+
+# ----------------------------
+# Request schema
+# ----------------------------
+
+class QuizRequest(BaseModel):
+    email: EmailStr
+    secret: str
+    url: HttpUrl
+
+    class Config:
+        extra = "allow"  # ignore any extra fields they send
+
+
+# ----------------------------
+# FastAPI app
+# ----------------------------
+
+app = FastAPI(title="LLM Analysis Quiz Solver")
 
 
 @app.get("/")
-def root():
-    return {"status": "ok", "message": "LLM Quiz API running"}
+async def healthcheck():
+    """Simple health-check for debugging / viva."""
+    return {
+        "status": "ok",
+        "message": "LLM Analysis Quiz API is running",
+    }
 
 
 @app.post("/api/quiz")
-async def quiz_endpoint(request: Request):
-    # Parse input JSON
+async def quiz_endpoint(raw_request: Request):
+    """
+    Entry point for the evaluation.
+    - Validates JSON payload.
+    - Checks secret.
+    - Visits quiz URL(s) and solves them in a loop.
+    """
+
+    # -------- 1. Parse JSON safely --------
     try:
-        payload = await request.json()
-    except:
-        return {"error": "Invalid JSON"}, 400
+        body = await raw_request.json()
+    except Exception:
+        # Spec: HTTP 400 for invalid JSON
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    # Validate secret
-    if payload.get("secret") != SECRET:
-        return {"error": "Forbidden"}, 403
+    try:
+        req = QuizRequest(**body)
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=f"Bad request: {e.errors()}")
 
-    email = payload.get("email")
-    url = payload.get("url")
+    # -------- 2. Verify secret --------
+    if req.secret != SECRET:
+        # Spec: HTTP 403 for invalid secrets
+        raise HTTPException(status_code=403, detail="Invalid secret")
 
-    if not email or not url:
-        return {"error": "Missing email or url"}, 400
+    # From this point on, secret is valid. We must respond 200,
+    # even if something goes wrong inside the quiz logic.
 
-    start_time = time.time()
+    start = time.monotonic()
+    current_url: str = str(req.url)
+    last_result: Optional[dict[str, Any]] = None
 
-    # Solve multi-step quiz
+    # -------- 3. Quiz solving loop --------
     while True:
-
-        # 3-minute timeout
-        if time.time() - start_time > 180:
-            return {"error": "Time exceeded"}
-
-        # 1. Fetch quiz page using Playwright
-        html = await fetch_quiz_page(url)
-
-        # 2. Parse quiz page for submit URL + answer
-        answer, submit_url = await process_quiz_page(html)
-
-        if not submit_url:
+        elapsed = time.monotonic() - start
+        if elapsed > QUIZ_TIME_LIMIT_SECONDS:
             return {
-                "error": "Submit URL missing",
+                "error": "Time limit exceeded",
+                "seconds": elapsed,
+                "last_result": last_result,
+            }
+
+        # (a) Fetch the quiz page (JS-rendered)
+        page_html = await fetch_quiz_page(current_url)
+
+        # (b) Interpret instructions: find submit URL + answer (if possible)
+        interpretation = await interpret_quiz_page(page_html, current_url)
+
+        if interpretation.submit_url is None:
+            # We cannot continue without a submit URL – return debug info instead of crashing.
+            return {
+                "error": "Failed to detect submit URL",
                 "reason": "parser_failed",
-                "debug_sample": html[:1500]
+                "quiz_url": current_url,
+                "debug": {
+                    "summary": interpretation.summary,
+                },
             }
 
-        # 3. Submit answer
-        result = await submit_answer(email, SECRET, url, submit_url, answer)
+        # (c) Post our answer
+        answer_payload = {
+            "email": req.email,
+            "secret": req.secret,
+            "url": current_url,
+            "answer": interpretation.answer,
+        }
 
-        # If correct and no next URL → quiz finished
-        if result.get("correct") and not result.get("url"):
-            return {
-                "done": "Quiz ended",
-                "answer_submitted": answer,
-                "final_response": result
-            }
+        submission_response = await post_answer(
+            submit_url=interpretation.submit_url,
+            payload=answer_payload,
+        )
+        last_result = submission_response
 
-        # If next URL → move to next quiz
-        if result.get("url"):
-            url = result["url"]
+        # Quiz server may tell us if we were correct and give a new URL.
+        next_url = submission_response.get("url")
+        is_correct = bool(submission_response.get("correct", False))
+
+        if next_url:
+            # They gave us the next quiz URL – move on.
+            current_url = next_url
             continue
 
-        # Otherwise retry same quiz
-        continue
+        # No next URL → either quiz is over or we got a final failure.
+        return {
+            "done": True,
+            "correct": is_correct,
+            "final_quiz_url": current_url,
+            "answer_submitted": interpretation.answer,
+            "server_response": submission_response,
+        }
